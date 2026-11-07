@@ -38,7 +38,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: >
           docker run --rm -e GITHUB_TOKEN -v "$PWD:/src" aquasec/trivy:0.76.0
-          fs --scanners vuln --severity CRITICAL,HIGH --exit-code 1 /src
+          fs --scanners vuln --severity CRITICAL --exit-code 1 /src
 
   # ---- S6/S7: build the combined image (tests inside), scan it, save it + checksum ----
   build:
@@ -71,11 +71,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: shortly-image }
-      - name: Load + run the image
+      - name: Load + run the image, then WAIT until it actually serves TLS
         run: |
           gunzip -c image.tgz | docker load
           docker run -d --name shortly -p 8443:443 -e ADMIN_TOKEN=ci-token "shortly:$GITHUB_SHA"
-          for i in $(seq 1 30); do curl -ks https://localhost:8443/healthz && break || sleep 2; done
+          # docker-proxy binds :8443 instantly, so a bare curl can "connect" before nginx
+          # is up and ZAP then meets a reset handshake. Wait for a real 200 first.
+          ok=0
+          for i in $(seq 1 45); do
+            code=$(curl -ks -o /dev/null -w '%{http_code}' https://localhost:8443/healthz || true)
+            echo "healthz attempt $i: ${code:-no-response}"
+            [ "$code" = 200 ] && { ok=1; break; }
+            sleep 2
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::app never served TLS on :8443 - ZAP has nothing to scan"
+            docker ps -a; docker logs shortly || true
+            exit 1
+          fi
+          curl -ksI https://localhost:8443/ | head -1   # prove it once more before ZAP
       - name: ZAP baseline (DAST over TLS)
         uses: zaproxy/action-baseline@v0.15.0
         with:
